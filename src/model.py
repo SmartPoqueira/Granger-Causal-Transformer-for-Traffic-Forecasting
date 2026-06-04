@@ -19,7 +19,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from .preprocessing import load_and_prepare_data, granger_causality_test, generate_shifted_trends
+from .preprocessing import load_and_prepare_data
 from .training import prepare_data_for_model_cv, permutation_feature_importance, plot_loss
 
 # ---------------------------------------------------------------------------
