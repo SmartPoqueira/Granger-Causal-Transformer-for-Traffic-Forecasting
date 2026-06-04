@@ -160,7 +160,7 @@ python -m src.ablation \
 
 ## Citation
 
-This repository is published under CC BY 4.0. If you use this code or build upon it, you **must** cite the paper:
+This repository is published under CC BY 4.0. If you use this code or build upon it, please cite the paper:
 
 ```bibtex
 @article{duran2026gct,
