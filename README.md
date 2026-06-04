@@ -1,7 +1,7 @@
 # Granger-Causal Transformer for Traffic Flow Forecasting in Smart Villages
 
 [![License: CC BY 4.0](https://img.shields.io/badge/License-CC%20BY%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by/4.0/)
-[![Journal: ACM TIST](https://img.shields.io/badge/Journal-ACM%20TIST-blue.svg)](https://dl.acm.org/doi/10.1145/3712290)
+[![Journal: ACM TIST](https://img.shields.io/badge/Journal-ACM%20TIST-blue.svg)](https://dl.acm.org/doi/10.1145/3787462)
 
 A time-series forecasting model that integrates **Granger causality analysis** with a **Transformer architecture** to predict weekly traffic flow in smart villages. The model fuses IoT vehicle-count data with Google Trends search indices, applying a dual statistical filter and a Granger causal attention mask.
 
