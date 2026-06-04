@@ -1,6 +1,6 @@
 # Granger-Causal Transformer for Traffic Flow Forecasting in Smart Villages
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: CC BY 4.0](https://img.shields.io/badge/License-CC--BY--4.0-lightgrey.svg)](https://creativecommons.org/licenses/by/4.0/)
 
 A time-series forecasting model that integrates **Granger causality analysis** with a **Transformer architecture** to predict traffic flow in smart villages. The model uses Google Trends data as exogenous signals, applying EEMD denoising and a learned causality gate to weight feature contributions based on their causal relationship with the target variable.
 
