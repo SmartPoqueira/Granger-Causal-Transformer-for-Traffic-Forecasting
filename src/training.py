@@ -1,8 +1,15 @@
 """
 training.py
 -----------
-Cross-validation training loop, early-stopping helpers, metrics logging,
-and loss-curve plotting for the CGTST pipeline.
+Cross-validation training loop, metrics logging, and loss-curve plotting
+for the GCT (Granger Causal Transformer) pipeline.
+
+All hyperparameters match the published paper values (Section 3.3, Table 1):
+  - optimizer: Adam, lr=0.0001
+  - epochs: 200
+  - batch_size: 64  (N_batch in paper)
+  - n_splits: 10 (expanding window CV)
+  - dropout: 0.15
 """
 
 import os
@@ -15,14 +22,12 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-from .model import CGTST, arrange_input, regularize, ridge_regularize
-
 
 # ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
 
-def plot_loss(history: dict, model_type: str = "cgtst", folder: str = "plots") -> None:
+def plot_loss(history: dict, model_type: str = "gct", folder: str = "plots") -> None:
     """
     Save a training/validation loss curve as PNG and append it to a JSON log.
 
@@ -38,28 +43,22 @@ def plot_loss(history: dict, model_type: str = "cgtst", folder: str = "plots") -
         plt.plot(history["val_loss"], label="Validation Loss")
     plt.title(f"Train and Validation Loss per Epoch — {model_type}")
     plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    if history.get("train_loss"):
-        plt.ylim([0, max(history["train_loss"]) * 1.1])
+    plt.ylabel("Loss (MSE)")
     plt.legend()
     plt.grid(True)
     os.makedirs(folder, exist_ok=True)
     plt.savefig(f"{folder}/training_history_{model_type}.png", dpi=500)
     plt.close()
 
-    loss_data = {
-        model_type: {
-            "train_loss": history.get("train_loss", []),
-            "val_loss": history.get("val_loss", []),
-        }
-    }
     log_path = f"{folder}/loss_history.json"
+    existing = {}
     if os.path.exists(log_path):
         with open(log_path, "r") as f:
             existing = json.load(f)
-    else:
-        existing = {}
-    existing.update(loss_data)
+    existing[model_type] = {
+        "train_loss": history.get("train_loss", []),
+        "val_loss": history.get("val_loss", []),
+    }
     with open(log_path, "w") as f:
         json.dump(existing, f, indent=4)
 
@@ -68,68 +67,72 @@ def plot_loss(history: dict, model_type: str = "cgtst", folder: str = "plots") -
 # Single-fold training
 # ---------------------------------------------------------------------------
 
-def train_model_cgtst(
-    cgtst: CGTST,
+def train_model_gct(
+    model: nn.Module,
     X_train: torch.Tensor,
     Y_train: torch.Tensor,
     X_val: torch.Tensor,
     Y_val: torch.Tensor,
-    lr: float,
-    max_iter: int,
-    lam: float = 0.0,
-    lam_ridge: float = 0.0,
-    check_every: int = 1,
-    verbose: int = 1,
+    lr: float = 0.0001,
+    max_iter: int = 200,
+    batch_size: int = 64,
+    verbose: int = 0,
 ) -> dict:
     """
-    Train the CGTST model using the Adam optimiser with optional L1 and ridge
-    regularisation on the causality gates.
+    Train the GCT model using Adam optimiser + MSE loss.
+
+    Paper hyperparameters (Table, Section 3.3):
+        lr=0.0001, epochs=200, batch_size=64 (N_batch).
 
     Args:
-        cgtst (CGTST): Model to train.
-        X_train, Y_train: Training tensors.
-        X_val, Y_val: Validation tensors.
-        lr (float): Learning rate.
-        max_iter (int): Number of epochs.
-        lam (float): L1 sparsity penalty on causality gates (λ_K in paper).
-        lam_ridge (float): Ridge penalty on Transformer weights (λ_M in paper).
-        check_every (int): Logging frequency (epochs).
-        verbose (int): Verbosity level.
+        model: GCT instance.
+        X_train: (N, context, num_variables)
+        Y_train: (N, 1)
+        X_val:   (M, context, num_variables)
+        Y_val:   (M, 1)
+        lr: Adam learning rate.
+        max_iter: Number of training epochs.
+        batch_size: Mini-batch size.
+        verbose: Print frequency (0 = silent).
 
     Returns:
         dict: {'train_loss': [...], 'val_loss': [...]}
     """
     loss_fn = nn.MSELoss(reduction="mean")
-    optimizer = torch.optim.Adam(cgtst.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     history: dict = {"train_loss": [], "val_loss": []}
+    N = X_train.shape[0]
 
-    for it in range(max_iter):
-        cgtst.train()
-        y_pred = cgtst(X_train)
-        loss = loss_fn(y_pred, Y_train)
+    for epoch in range(max_iter):
+        model.train()
+        # Mini-batch loop
+        perm = torch.randperm(N, device=X_train.device)
+        epoch_loss = 0.0
+        n_batches = 0
+        for start in range(0, N, batch_size):
+            idx = perm[start: start + batch_size]
+            x_b = X_train[idx]
+            y_b = Y_train[idx].squeeze(-1)
+            optimizer.zero_grad()
+            pred = model(x_b)
+            loss = loss_fn(pred, y_b)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            n_batches += 1
 
-        reg = 0.0
-        if lam > 0:
-            reg += regularize(cgtst, lam)
-        if lam_ridge > 0:
-            reg += ridge_regularize(cgtst, lam_ridge)
-        loss = loss + reg
+        model.eval()
+        with torch.no_grad():
+            val_pred = model(X_val)
+            val_loss = loss_fn(val_pred, Y_val.squeeze(-1))
 
-        loss.backward()
-        optimizer.step()
-        cgtst.zero_grad()
+        avg_train = epoch_loss / max(1, n_batches)
+        history["train_loss"].append(avg_train)
+        history["val_loss"].append(val_loss.item())
 
-        if (it + 1) % check_every == 0:
-            cgtst.eval()
-            with torch.no_grad():
-                val_loss = loss_fn(cgtst(X_val), Y_val)
-            history["train_loss"].append(loss.item())
-            history["val_loss"].append(val_loss.item())
-
-            if verbose > 0:
-                print(f"{'—' * 10} Iter {it + 1} {'—' * 10}")
-                print(f"  Train Loss = {loss.item():.6f}")
-                print(f"  Val   Loss = {val_loss.item():.6f}")
+        if verbose > 0 and ((epoch + 1) % 50 == 0 or epoch == 0):
+            print(f"  Epoch {epoch+1:03d}/{max_iter}  "
+                  f"train_loss={avg_train:.6f}  val_loss={val_loss.item():.6f}")
 
     return history
 
@@ -139,94 +142,100 @@ def train_model_cgtst(
 # ---------------------------------------------------------------------------
 
 def permutation_feature_importance(
-    model: CGTST,
+    model: nn.Module,
     X_val: torch.Tensor,
     Y_val: torch.Tensor,
     selected_columns: list,
     threshold: float = 1.0,
 ) -> dict:
     """
-    Permutation Feature Importance (PFI) to validate which features are causal.
+    Permutation Feature Importance (PFI) to validate causal features.
 
-    A PFI ratio < *threshold* indicates the feature carries causal information:
+    A PFI ratio < *threshold* indicates the feature carries predictive signal:
     permuting it raises the validation loss proportionally.
 
     Args:
-        model (CGTST): Trained model.
-        X_val (torch.Tensor): Validation input of shape (T, context, n_features).
-        Y_val (torch.Tensor): Validation target.
-        selected_columns (list): Feature names corresponding to the last dim of X_val.
-        threshold (float): Features with PFI ratio < threshold are retained.
+        model: Trained GCT.
+        X_val: (T, context, n_features)
+        Y_val: (T, 1)
+        selected_columns: Feature names.
+        threshold: Ratio cutoff.
 
     Returns:
-        dict: {col: pfi_ratio} for columns that pass the threshold.
+        dict: {col: pfi_ratio} for columns that pass.
     """
     model.eval()
     loss_fn = nn.MSELoss(reduction="mean")
-    base_loss = loss_fn(model(X_val), Y_val).item()
+    with torch.no_grad():
+        base_loss = loss_fn(model(X_val), Y_val.squeeze(-1)).item()
     print(f"PFI — Baseline validation loss: {base_loss:.6f}")
 
     causal = {}
     for i, col in enumerate(selected_columns):
         X_perm = X_val.clone()
-        perm_idx = torch.randperm(X_perm.size(1))
-        X_perm[:, :, i] = X_perm[:, perm_idx, i]
-
+        perm_idx = torch.randperm(X_perm.size(0))
+        X_perm[:, :, i] = X_perm[perm_idx, :, i]
         with torch.no_grad():
-            perm_loss = loss_fn(model(X_perm), Y_val).item()
-
-        ratio = base_loss / perm_loss if perm_loss != 0 else float("inf")
-        print(f"  PFI ratio [{col}]: {ratio:.6f}")
+            perm_loss = loss_fn(model(X_perm), Y_val.squeeze(-1)).item()
+        ratio = base_loss / perm_loss if perm_loss > 0 else float("inf")
+        print(f"  PFI [{col}]: {ratio:.4f}")
         if ratio < threshold:
             causal[col] = ratio
-
     return causal
 
 
 # ---------------------------------------------------------------------------
-# Cross-validation loop
+# Cross-validation loop  (10-fold expanding window, paper Section 4)
 # ---------------------------------------------------------------------------
 
 def prepare_data_for_model_cv(
     data,
     selected_columns: list,
-    clstm_params: dict,
+    model_params: dict,
     training_params: dict,
+    causal_matrix: torch.Tensor | None,
     folder: str,
     device: torch.device,
-    n_splits: int = 5,
+    n_splits: int = 10,
     min_train_ratio: float = 0.5,
     max_train_ratio: float = 0.8,
     test_ratio: float = 0.2,
-    case: str = "cgtst",
+    context: int = 6,
+    case: str = "gct_full",
+    use_causal_mask: bool = True,
 ) -> tuple:
     """
-    Time-series cross-validation (expanding window) for CGTST.
+    10-fold expanding-window cross-validation for GCT.
 
-    Trains one CGTST model per fold, evaluates on a hold-out window, and
-    aggregates metrics.  Reproduces the TimeSeriesSplit scheme from the paper.
+    Paper uses:
+        n_splits=10, min_train_ratio=0.5, max_train_ratio=0.8, test_ratio=0.2,
+        context (input window) = 6 weeks.
 
     Args:
-        data (pd.DataFrame): Full dataset (features + target).
-        selected_columns (list): Feature column names.
-        clstm_params (dict): Model hyperparameters.
-        training_params (dict): Training hyperparameters.
-        folder (str): Output directory for logs and plots.
-        device (torch.device): Compute device.
-        n_splits (int): Number of CV folds.
-        min_train_ratio (float): Fraction of data used in the first (smallest) fold.
-        max_train_ratio (float): Fraction of data used in the last (largest) fold.
-        test_ratio (float): Fraction of data used as test window per fold.
-        case (str): Identifier written to the log file.
+        data: pd.DataFrame with features + 'unique_num_plate_count' target.
+        selected_columns: Feature columns after Granger + correlation filtering.
+        model_params: Dict with lstm_units, dense_units, num_heads,
+                      dropout_rate, alpha_causal.
+        training_params: Dict with learning_rate, epochs, batch_size, verbose.
+        causal_matrix: Precomputed Granger C matrix (num_features × num_features).
+        folder: Output directory.
+        device: Torch device.
+        n_splits, min_train_ratio, max_train_ratio, test_ratio: CV scheme.
+        context: Sliding window length (paper: 6).
+        case: Log filename identifier.
+        use_causal_mask: If False, C is disabled (ablation switch).
 
     Returns:
         tuple: (last_history, models, fold_summaries, validation_data)
     """
-    import numpy as np
+    from .model import GCT, arrange_input, regularize, ridge_regularize
 
-    X = data[selected_columns].values
-    y = data["unique_num_plate_count"].values
-    total = len(X)
+    # Build data arrays
+    all_cols = selected_columns + (
+        ["unique_num_plate_count"] if "unique_num_plate_count" not in selected_columns else []
+    )
+    X_full = data[all_cols].values.astype(np.float32)
+    total = len(X_full)
     test_size = int(test_ratio * total)
     min_train = int(min_train_ratio * total)
     max_train = int(max_train_ratio * total)
@@ -238,59 +247,63 @@ def prepare_data_for_model_cv(
         te_end = min(tr_end + test_size, total)
         splits.append((np.arange(0, tr_end), np.arange(tr_end, te_end)))
 
-    context = clstm_params.get("context", 6)
-    os.makedirs(folder, exist_ok=True)
+    num_variables = len(selected_columns) + 1   # features + target
 
+    # Move causal matrix to device (sub-matrix for selected features only)
+    C_device = None
+    if causal_matrix is not None and use_causal_mask:
+        C_device = causal_matrix.to(device)
+
+    os.makedirs(folder, exist_ok=True)
     fold_summaries, histories, models, validation_data = [], [], [], []
     total_time = 0.0
     last_history = {}
 
-    with open(f"{folder}/cgtst_pytorch.txt", "w") as f:
-        f.write(f"\n\n--- {case.capitalize()} Model Results ---\n")
+    with open(f"{folder}/{case}.txt", "w") as f:
+        f.write(f"\n\n--- {case} Results (n_splits={n_splits}, context={context}) ---\n")
         f.write(f"Total samples: {total}\n")
+        f.write(f"use_causal_mask: {use_causal_mask}\n\n")
 
         for fold_idx, (train_idx, test_idx) in enumerate(splits):
-            if len(train_idx) < context + 1:
-                msg = f"Fold {fold_idx+1} skipped: insufficient training samples."
+            if len(train_idx) < context + 1 or len(test_idx) < context + 1:
+                msg = f"Fold {fold_idx+1} skipped: insufficient samples."
                 print(msg); f.write(msg + "\n")
                 continue
 
             t0 = time.time()
-            X_tr, X_te = X[train_idx], X[test_idx]
-            y_tr, y_te = y[train_idx], y[test_idx]
-
-            X_tr_t = torch.from_numpy(X_tr).float().to(device)
-            Y_tr_t = torch.from_numpy(y_tr).float().to(device)
-            X_te_t = torch.from_numpy(X_te).float().to(device)
-            Y_te_t = torch.from_numpy(y_te).float().to(device)
+            X_tr = torch.from_numpy(X_full[train_idx]).to(device)
+            X_te = torch.from_numpy(X_full[test_idx]).to(device)
 
             try:
-                X_arr, Y_arr = arrange_input(X_tr_t, context)
-                X_val_arr, Y_val_arr = arrange_input(X_te_t, context)
+                X_arr, Y_arr = arrange_input(X_tr, context)
+                X_val_arr, Y_val_arr = arrange_input(X_te, context)
             except ValueError as e:
                 msg = f"Fold {fold_idx+1} skipped: {e}"
                 print(msg); f.write(msg + "\n")
                 continue
 
-            out_dim = Y_arr.shape[1] if Y_arr.ndim > 1 else 1
-            model = CGTST(
-                input_dim=X_tr.shape[1],
-                model_dim=clstm_params.get("model_dim", 64),
-                num_heads=clstm_params.get("num_heads", 4),
-                num_layers=clstm_params.get("num_layers", 2),
-                dropout=clstm_params.get("dropout", 0.1),
-                output_dim=out_dim,
-                context=context,
+            # Instantiate GCT with paper hyperparameters
+            model = GCT(
+                num_variables=num_variables,
+                lstm_units=model_params.get("lstm_units", 32),
+                num_heads=model_params.get("num_heads", 4),
+                dense_units=model_params.get("dense_units", 64),
+                dropout_rate=model_params.get("dropout_rate", 0.15),
+                causal_matrix=C_device,
+                alpha=model_params.get("alpha_causal", 1.0),
+                use_causal_mask=use_causal_mask,
             ).to(device)
 
-            history = train_model_cgtst(
-                model, X_arr, Y_arr, X_val_arr, Y_val_arr,
-                lr=training_params.get("learning_rate", 0.01),
+            history = train_model_gct(
+                model=model,
+                X_train=X_arr,
+                Y_train=Y_arr,
+                X_val=X_val_arr,
+                Y_val=Y_val_arr,
+                lr=training_params.get("learning_rate", 0.0001),
                 max_iter=training_params.get("epochs", 200),
-                lam=training_params.get("lam", 0.0),
-                lam_ridge=training_params.get("lam_ridge", 0.0),
-                check_every=training_params.get("check_every", 1),
-                verbose=training_params.get("verbose", 1),
+                batch_size=training_params.get("batch_size", 64),
+                verbose=training_params.get("verbose", 0),
             )
             histories.append(history)
             models.append(model)
@@ -300,12 +313,7 @@ def prepare_data_for_model_cv(
             model.eval()
             with torch.no_grad():
                 preds = model(X_val_arr).cpu().numpy()
-                y_true = Y_val_arr.cpu().numpy()
-
-            if preds.shape != y_true.shape:
-                msg = f"Fold {fold_idx+1}: shape mismatch {preds.shape} vs {y_true.shape}, skipped."
-                print(msg); f.write(msg + "\n")
-                continue
+                y_true = Y_val_arr.squeeze(-1).cpu().numpy()
 
             mae = mean_absolute_error(y_true, preds)
             mse = mean_squared_error(y_true, preds)
@@ -313,28 +321,35 @@ def prepare_data_for_model_cv(
             elapsed = time.time() - t0
             total_time += elapsed
 
-            summary = {
-                "fold": fold_idx + 1, "train_size": len(train_idx), "test_size": len(test_idx),
+            fold_summaries.append({
+                "fold": fold_idx + 1,
+                "train_size": len(train_idx),
+                "test_size": len(test_idx),
                 "mae": mae, "mse": mse, "r2": r2,
-            }
-            fold_summaries.append(summary)
-
-            f.write(f"\nFold {fold_idx+1}: MAE={mae:.4f}  MSE={mse:.4f}  R2={r2:.4f}  "
-                    f"Time={elapsed:.2f}s\n")
-            gates = model.get_causality_gates()
-            f.write(f"  Causality gates: {gates.tolist()}\n")
+            })
+            msg = (f"Fold {fold_idx+1}: MAE={mae:.4f}  MSE={mse:.4f}  "
+                   f"R²={r2:.4f}  Time={elapsed:.2f}s")
+            print(f"  {msg}")
+            f.write(msg + "\n")
 
         if fold_summaries:
             avg_mae = np.mean([s["mae"] for s in fold_summaries])
             avg_mse = np.mean([s["mse"] for s in fold_summaries])
             avg_r2  = np.mean([s["r2"]  for s in fold_summaries])
+            std_mae = np.std([s["mae"] for s in fold_summaries])
+            std_mse = np.std([s["mse"] for s in fold_summaries])
+            std_r2  = np.std([s["r2"]  for s in fold_summaries])
             avg_t   = total_time / len(fold_summaries)
-            f.write(f"\nAverage — MAE: {avg_mae:.4f}  MSE: {avg_mse:.4f}  "
-                    f"R2: {avg_r2:.4f}  Time: {avg_t:.2f}s\n")
+            summary_line = (f"\nAverage — MAE: {avg_mae:.4f}±{std_mae:.4f}  "
+                            f"MSE: {avg_mse:.4f}±{std_mse:.4f}  "
+                            f"R²: {avg_r2:.4f}±{std_r2:.4f}  "
+                            f"Time: {avg_t:.2f}s")
+            print(summary_line)
+            f.write(summary_line + "\n")
         else:
             f.write("\nNo valid folds.\n")
 
     if histories:
-        plot_loss(last_history, model_type="cgtst_pytorch", folder=folder)
+        plot_loss(last_history, model_type=case, folder=folder)
 
     return last_history, models, fold_summaries, validation_data

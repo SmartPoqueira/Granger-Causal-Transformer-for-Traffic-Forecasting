@@ -113,16 +113,17 @@ def run_test(series: np.ndarray) -> float:
     return p_value
 
 
-def granger_causality_test(data: pd.DataFrame, max_lag: int = 6) -> tuple:
+def granger_causality_test(data: pd.DataFrame, max_lag: int = 12) -> tuple:
     """
     Run Granger causality tests for every feature against the target variable
     ``unique_num_plate_count``.
 
     The F-test p-value (``ssr_ftest``) is used to select the best lag.
+    max_lag is set to 12 by default (paper: p_max=12 weeks, Section 3.2).
 
     Args:
         data (pd.DataFrame): DataFrame containing the target and all features.
-        max_lag (int): Maximum lag order to test (1 … max_lag inclusive).
+        max_lag (int): Maximum lag order to test (paper: 12).
 
     Returns:
         tuple: (results, lags, valid_lags, run_test_results)

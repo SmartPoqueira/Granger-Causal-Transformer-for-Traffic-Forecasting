@@ -1,23 +1,39 @@
 """
 model.py
 --------
-Neural network architectures for the CGTST (Causality-Gated Time Series
-Transformer) pipeline.
+GCT — Granger Causal Transformer for traffic forecasting.
+
+Architecture (from paper Table, Section 3.3):
+  0. Input           : (N_batch, num_variables)
+  1. LSTM            : (N_batch, lstm_units=32)         — temporal encoder
+  2. LayerNorm       : (N_batch, lstm_units)
+  3. CausalAttention : (N_batch, num_variables)          — num_heads=4, key_dim=num_variables
+                         Attention(Q,K,V) = softmax(QK^T/√d_k ⊙ (1+C)) V
+  4. LayerNorm       : (N_batch, num_variables)
+  5. Add (residual)  : adds dense_proj (projected LSTM) to attention output
+  6. Concatenate     : (N_batch, lstm_units + num_variables)
+  7. Dense(relu)     : (N_batch, dense_units=64)
+  8. Dropout(0.15)
+  9. Dense(relu)     : (N_batch, dense_units//2=32)
+  10. Dropout(0.15)
+  11. Dense(1)       : scalar forecast
+
+The causal matrix C ∈ R^{m×m} encodes Granger relationships:
+  C[i,j] = 1/best_lag  if X_j Granger-causes X_i (p < 0.05)
+  C[i,j] = 0           otherwise
+C is built by granger_analysis.create_causal_matrix(). See paper Eq. (4).
 
 References
 ----------
 Durán-López et al., "Forecasting Traffic in Smart Villages via Granger-Causal
-Attention", ACM (2025).  See paper/figures/BlockDiagram.png for the architecture.
-
-Usage
------
-    from src.model import CGTST, arrange_input, regularize, ridge_regularize
+Attention", ACM (2025). See paper/figures/BlockDiagram.png.
 """
 
 import argparse
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .preprocessing import load_and_prepare_data
 from .training import prepare_data_for_model_cv, permutation_feature_importance, plot_loss
@@ -42,201 +58,226 @@ def set_seed(seed: int = 42) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def activation_helper(name: str) -> nn.Module:
-    """Return an activation module by name ('relu', 'tanh', or 'sigmoid')."""
-    name = name.lower()
-    if name == "relu":
-        return nn.ReLU()
-    elif name == "tanh":
-        return nn.Tanh()
-    elif name == "sigmoid":
-        return nn.Sigmoid()
-    raise ValueError(f"Unsupported activation: {name}")
-
-
 # ---------------------------------------------------------------------------
-# Positional Encoding
+# Causal Self-Attention  (paper Eq. 4)
 # ---------------------------------------------------------------------------
 
-class PositionalEncoding(nn.Module):
+class CausalSelfAttention(nn.Module):
     """
-    Sinusoidal positional encoding as described in Vaswani et al. (2017).
+    Multi-head self-attention modified with a Granger causal mask.
+
+    The attention score matrix is element-wise multiplied (Hadamard product)
+    by (1 + C), where C is the Granger causal matrix:
+
+        Attention(Q, K, V) = softmax(QK^T / √d_k  ⊙  (1 + C)) V
+
+    This boosts attention scores between causally related pairs and leaves
+    non-causal pairs unchanged (C[i,j]=0 → factor = 1).
 
     Args:
-        d_model (int): Embedding dimension.
-        max_len (int): Maximum sequence length.
-    """
-
-    def __init__(self, d_model: int, max_len: int = 5000) -> None:
-        super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model)
-        )
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe.unsqueeze(0))  # (1, max_len, d_model)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Tensor of shape (batch, seq_len, d_model).
-        Returns:
-            x + positional encoding, same shape.
-        """
-        return x + self.pe[:, : x.size(1), :]
-
-
-# ---------------------------------------------------------------------------
-# TST — Time Series Transformer
-# ---------------------------------------------------------------------------
-
-class TST(nn.Module):
-    """
-    Time Series Transformer (TST) backbone.
-
-    Projects input features to *model_dim*, applies positional encoding,
-    passes through a stack of Transformer encoder layers, then flattens and
-    linearly projects to *output_dim*.
-
-    Args:
-        input_dim (int): Number of input features (m in the paper).
-        model_dim (int): Transformer hidden dimension (d).
-        num_heads (int): Number of multi-head attention heads.
-        num_layers (int): Number of Transformer encoder layers.
-        dropout (float): Dropout rate.
-        output_dim (int): Output dimension (n = 1 for single-step forecasting).
-        context (int): Input window length (w).
+        num_variables (int): Number of input features m (= key_dim in paper).
+        num_heads (int): Number of attention heads (paper: 4).
+        causal_matrix (torch.Tensor | None): Shape (m, m).  If None, C = 0
+            (reduces to standard attention — used for ablation).
+        alpha (float): Scaling factor on C. Paper uses alpha=1.
     """
 
     def __init__(
         self,
-        input_dim: int,
-        model_dim: int,
-        num_heads: int,
-        num_layers: int,
-        dropout: float = 0.1,
-        output_dim: int = 1,
-        context: int = 6,
+        num_variables: int,
+        num_heads: int = 4,
+        causal_matrix: torch.Tensor | None = None,
+        alpha: float = 1.0,
     ) -> None:
         super().__init__()
-        self.context = context
-        self.input_linear = nn.Linear(input_dim, model_dim)
-        self.positional_encoding = PositionalEncoding(model_dim)
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=model_dim,
-            nhead=num_heads,
-            dropout=dropout,
+        self.num_variables = num_variables
+        self.num_heads = num_heads
+        self.alpha = alpha
+        self.head_dim = max(1, num_variables // num_heads)
+
+        self.q_proj = nn.Linear(num_variables, num_heads * self.head_dim)
+        self.k_proj = nn.Linear(num_variables, num_heads * self.head_dim)
+        self.v_proj = nn.Linear(num_variables, num_heads * self.head_dim)
+        self.out_proj = nn.Linear(num_heads * self.head_dim, num_variables)
+
+        # Register causal matrix as a non-trainable buffer
+        if causal_matrix is not None:
+            self.register_buffer("C", causal_matrix.float())
+        else:
+            self.register_buffer("C", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (batch, seq_len, num_variables)  or  (batch, num_variables)
+        Returns:
+            out: same shape as x
+        """
+        squeeze = False
+        if x.dim() == 2:
+            x = x.unsqueeze(1)   # treat as seq_len=1
+            squeeze = True
+
+        B, T, m = x.shape
+        H, d = self.num_heads, self.head_dim
+
+        Q = self.q_proj(x).view(B, T, H, d).transpose(1, 2)  # (B, H, T, d)
+        K = self.k_proj(x).view(B, T, H, d).transpose(1, 2)
+        V = self.v_proj(x).view(B, T, H, d).transpose(1, 2)
+
+        # Scaled dot-product: (B, H, T, T)
+        scale = d ** 0.5
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / scale
+
+        # Apply causal mask ⊙ (1 + alpha*C) per paper Eq. (4)
+        if self.C is not None:
+            # C is (m, m). We use the first T×T block (T=1 for our tabular case).
+            # In the tabular setting T=1, so scores is (B, H, 1, 1) — trivial.
+            # For sequence inputs (T=m) the mask is (T, T).
+            mask = 1.0 + self.alpha * self.C[:T, :T]   # (T, T)
+            scores = scores * mask.unsqueeze(0).unsqueeze(0)
+
+        attn = F.softmax(scores, dim=-1)               # (B, H, T, T)
+        out = torch.matmul(attn, V)                    # (B, H, T, d)
+        out = out.transpose(1, 2).contiguous().view(B, T, H * d)
+        out = self.out_proj(out)                       # (B, T, m)
+
+        if squeeze:
+            out = out.squeeze(1)
+        return out
+
+
+# ---------------------------------------------------------------------------
+# GCT — Granger Causal Transformer  (paper Table, Section 3.3)
+# ---------------------------------------------------------------------------
+
+class GCT(nn.Module):
+    """
+    Granger Causal Transformer for multivariate traffic forecasting.
+
+    Full architecture (paper Table, all hypers as published):
+        Input (N_batch, num_variables)
+        → LSTM(lstm_units=32, return_sequences=True)
+        → LayerNorm
+        → [Dense projection to num_variables]        # aligns dims for attention
+        → CausalSelfAttention(num_heads=4, key_dim=num_variables, C=causal_matrix)
+        → LayerNorm
+        → Add (residual: dense_proj + attention)
+        → Concatenate([LSTM output, Add output])
+        → Dense(dense_units=64, ReLU)
+        → Dropout(0.15)
+        → Dense(dense_units//2=32, ReLU)
+        → Dropout(0.15)
+        → Dense(1)
+
+    Args:
+        num_variables (int): Number of input features m.
+        lstm_units (int): LSTM hidden size (paper: 32).
+        num_heads (int): Attention heads (paper: 4).
+        dense_units (int): First dense layer width (paper: 64).
+        dropout_rate (float): Dropout probability (paper: 0.15).
+        causal_matrix (torch.Tensor | None): Pre-computed Granger matrix C.
+        alpha (float): Causal mask scaling (paper: 1.0).
+        use_causal_mask (bool): If False, C is zeroed — ablation switch.
+    """
+
+    def __init__(
+        self,
+        num_variables: int,
+        lstm_units: int = 32,
+        num_heads: int = 4,
+        dense_units: int = 64,
+        dropout_rate: float = 0.15,
+        causal_matrix: torch.Tensor | None = None,
+        alpha: float = 1.0,
+        use_causal_mask: bool = True,
+    ) -> None:
+        super().__init__()
+        self.num_variables = num_variables
+        self.lstm_units = lstm_units
+
+        # Step 1: LSTM sequential encoder
+        self.lstm = nn.LSTM(
+            input_size=num_variables,
+            hidden_size=lstm_units,
             batch_first=True,
         )
-        self.transformer_encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-        self.flatten = nn.Flatten()
-        self.output_linear = nn.Linear(model_dim * context, output_dim)
+        self.ln1 = nn.LayerNorm(lstm_units)
+
+        # Project LSTM output to num_variables for attention compatibility
+        self.dense_proj = nn.Linear(lstm_units, num_variables, bias=False)
+
+        # Step 2: Causal self-attention with Granger mask (paper Eq. 4)
+        C = causal_matrix if use_causal_mask else None
+        self.attention = CausalSelfAttention(
+            num_variables=num_variables,
+            num_heads=num_heads,
+            causal_matrix=C,
+            alpha=alpha,
+        )
+        self.ln2 = nn.LayerNorm(num_variables)
+
+        # Step 3: Feed-forward classifier (Concatenate → Dense → Dense → Dense(1))
+        concat_dim = lstm_units + num_variables
+        self.ff = nn.Sequential(
+            nn.Linear(concat_dim, dense_units),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(dense_units, dense_units // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(dense_units // 2, 1),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: (batch, w, m)
+            x: (batch, seq_len, num_variables)
         Returns:
-            y_pred: (batch, n)
+            y: (batch,) — scalar forecast
         """
-        x = self.input_linear(x)           # (batch, w, d)
-        x = self.positional_encoding(x)    # (batch, w, d)
-        x = self.transformer_encoder(x)    # (batch, w, d)
-        x = self.flatten(x)                # (batch, w*d)
-        return self.output_linear(x)       # (batch, n)
+        # LSTM: temporal encoding → take last hidden state
+        lstm_out, _ = self.lstm(x)          # (B, T, lstm_units)
+        lstm_out = self.ln1(lstm_out)        # LayerNorm
+        lstm_last = lstm_out[:, -1, :]       # (B, lstm_units)
+
+        # Project to attention space and apply causal self-attention
+        proj = self.dense_proj(lstm_out)     # (B, T, num_variables)
+        attn = self.attention(proj)          # (B, T, num_variables)
+        attn = self.ln2(attn)
+        attn_last = attn[:, -1, :]           # (B, num_variables)
+
+        # Residual + Concatenate
+        added = proj[:, -1, :] + attn_last   # (B, num_variables)
+        concat = torch.cat([lstm_last, added], dim=-1)  # (B, lstm_units + num_variables)
+
+        return self.ff(concat).squeeze(-1)   # (B,)
 
 
 # ---------------------------------------------------------------------------
-# CGTST — Causality-Gated Time Series Transformer
+# Regularisation helpers (kept for backward compatibility / future use)
 # ---------------------------------------------------------------------------
 
-class CGTST(nn.Module):
+def regularize(model: nn.Module, lam: float) -> torch.Tensor:
     """
-    Causality-Gated Time Series Transformer (CGTST).
-
-    Wraps a TST with a learnable causality gate vector g ∈ R^m.
-    At inference time, softmax(g) is element-wise multiplied with the input
-    to weight features by their estimated causal relevance.
-
-    The gate is regularised with L1 (λ_K) and ridge (λ_M) penalties to
-    encourage sparsity (see paper, Eq. 3–5).
+    L1 regularisation on all model parameters.
 
     Args:
-        input_dim (int): Number of input features m.
-        model_dim (int): Transformer hidden dimension d.
-        num_heads (int): Multi-head attention heads.
-        num_layers (int): Transformer encoder layers.
-        dropout (float): Dropout rate.
-        output_dim (int): Forecast horizon n (1 for one-step-ahead).
-        context (int): Input window length w.
+        model: Any nn.Module.
+        lam: Regularisation coefficient.
     """
-
-    def __init__(
-        self,
-        input_dim: int,
-        model_dim: int,
-        num_heads: int,
-        num_layers: int,
-        dropout: float = 0.1,
-        output_dim: int = 1,
-        context: int = 6,
-    ) -> None:
-        super().__init__()
-        self.input_dim = input_dim
-        self.causality_gate = nn.Parameter(torch.ones(input_dim))
-        self.tst = TST(input_dim, model_dim, num_heads, num_layers, dropout, output_dim, context)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (batch, w, m)
-        Returns:
-            y_pred: (batch, n)
-        """
-        gate = torch.softmax(self.causality_gate, dim=0)  # (m,)
-        x = x * gate.unsqueeze(0).unsqueeze(0)             # (batch, w, m)
-        return self.tst(x)
-
-    def get_causality_gates(self) -> np.ndarray:
-        """Return the softmax-normalised gate weights as a NumPy array."""
-        return torch.softmax(self.causality_gate, dim=0).detach().cpu().numpy()
+    return lam * sum(p.abs().sum() for p in model.parameters())
 
 
-# ---------------------------------------------------------------------------
-# Regularisation
-# ---------------------------------------------------------------------------
-
-def regularize(network: CGTST, lam: float) -> torch.Tensor:
+def ridge_regularize(model: nn.Module, lam: float) -> torch.Tensor:
     """
-    L1 regularisation on the causality gate (λ_K in the paper).
-    Encourages sparsity: unimportant features are pushed toward zero.
+    Ridge (L2) regularisation on all model parameters.
 
     Args:
-        network (CGTST): Model instance.
-        lam (float): Regularisation coefficient λ_K.
+        model: Any nn.Module.
+        lam: Regularisation coefficient.
     """
-    return lam * torch.sum(torch.abs(network.causality_gate))
-
-
-def ridge_regularize(network: CGTST, lam: float) -> torch.Tensor:
-    """
-    Ridge (L2) regularisation on the Transformer weight matrices (λ_M).
-
-    Penalises the input projection, output projection, and the first
-    feed-forward layer of the first Transformer encoder block.
-
-    Args:
-        network (CGTST): Model instance.
-        lam (float): Regularisation coefficient λ_M.
-    """
-    return lam * (
-        torch.sum(network.tst.input_linear.weight ** 2)
-        + torch.sum(network.tst.output_linear.weight ** 2)
-        + torch.sum(network.tst.transformer_encoder.layers[0].linear1.weight ** 2)
-        + torch.sum(network.tst.transformer_encoder.layers[0].linear2.weight ** 2)
-    )
+    return lam * sum((p ** 2).sum() for p in model.parameters())
 
 
 def restore_parameters(model: nn.Module, best_model: nn.Module) -> None:
@@ -259,7 +300,7 @@ def arrange_input(data: torch.Tensor, context: int) -> tuple:
 
     Returns:
         input_seq:  (T - context, context, dim)
-        target_seq: (T - context, dim)  — the step immediately after each window
+        target_seq: (T - context, 1)  — the step immediately after each window
     """
     assert context >= 1 and isinstance(context, int)
     if data.ndim != 2:
@@ -267,9 +308,9 @@ def arrange_input(data: torch.Tensor, context: int) -> tuple:
     T, dim = data.shape
     input_seq = torch.zeros(T - context, context, dim, dtype=torch.float32, device=data.device)
     for i in range(context):
-        input_seq[:, i, :] = data[i : T - context + i]
-    target_seq = data[context:T].detach()
-    return input_seq.detach(), target_seq
+        input_seq[:, i, :] = data[i: T - context + i]
+    target_seq = data[context:T, -1:]   # target is the last column (plate count)
+    return input_seq.detach(), target_seq.detach()
 
 
 # ---------------------------------------------------------------------------
@@ -277,74 +318,112 @@ def arrange_input(data: torch.Tensor, context: int) -> tuple:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="CGTST — Causality-Gated Time Series Transformer")
-    parser.add_argument("--seed", type=int, default=161)
+    parser = argparse.ArgumentParser(description="GCT — Granger Causal Transformer")
+    parser.add_argument("--seed", type=int, default=161,
+                        help="Random seed (paper uses 161)")
     parser.add_argument("--folder", type=str, default="plots161")
     parser.add_argument("--trends_file", type=str, default="./DB/google_trends_data.csv")
     parser.add_argument("--plates_file", type=str, default="./DB/unique_num_plate_count_per_week.csv")
-    parser.add_argument("--learning_rate", type=float, default=0.01)
-    parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--input_window", type=int, default=6)
-    parser.add_argument("--lam", type=float, default=1e-3, help="L1 gate sparsity coefficient λ_K")
-    parser.add_argument("--lam_ridge", type=float, default=1e-3, help="Ridge weight penalty λ_M")
-    parser.add_argument("--n_splits", type=int, default=10)
+    # Paper hyperparameters (Table, Section 3.3)
+    parser.add_argument("--lstm_units", type=int, default=32,
+                        help="LSTM hidden units (paper: 32)")
+    parser.add_argument("--dense_units", type=int, default=64,
+                        help="First dense layer width (paper: 64)")
+    parser.add_argument("--num_heads", type=int, default=4,
+                        help="Attention heads (paper: 4)")
+    parser.add_argument("--dropout_rate", type=float, default=0.15,
+                        help="Dropout probability (paper: 0.15)")
+    parser.add_argument("--learning_rate", type=float, default=0.0001,
+                        help="Adam learning rate (paper: 0.0001)")
+    parser.add_argument("--epochs", type=int, default=200,
+                        help="Training epochs (paper: 200)")
+    parser.add_argument("--batch_size", type=int, default=64,
+                        help="Batch size (paper: N_batch=64)")
+    parser.add_argument("--input_window", type=int, default=6,
+                        help="Input context window (paper: 6 weeks)")
+    parser.add_argument("--max_lag", type=int, default=12,
+                        help="Maximum Granger lag (paper: p_max=12)")
+    parser.add_argument("--corr_threshold", type=float, default=0.5,
+                        help="Correlation filter threshold alpha (paper: 0.5)")
+    parser.add_argument("--alpha_causal", type=float, default=1.0,
+                        help="Causal mask scaling (paper: 1.0)")
+    # Cross-validation (paper: 10-fold expanding window)
+    parser.add_argument("--n_splits", type=int, default=10,
+                        help="Number of CV folds (paper: 10)")
     parser.add_argument("--min_train_ratio", type=float, default=0.5)
     parser.add_argument("--max_train_ratio", type=float, default=0.8)
     parser.add_argument("--test_ratio", type=float, default=0.2)
-    parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--hidden", type=int, default=64)
-    parser.add_argument("--check_every", type=int, default=1)
     parser.add_argument("--verbose", type=int, default=1)
     args = parser.parse_args()
 
     set_seed(args.seed)
+
+    from .granger_analysis import granger_causality_test, generate_shifted_trends, create_causal_matrix
 
     data = load_and_prepare_data(
         args.trends_file, args.plates_file,
         normalize=True, apply_eemd=True, num_imfs=5, noise_width=0.05,
     )
 
-    feature_columns = [c for c in data.columns if c != "unique_num_plate_count"]
-    print(f"Feature columns ({len(feature_columns)}): {feature_columns}")
+    # Feature selection: Granger causality + correlation filter
+    results, lags, valid_lags, _ = granger_causality_test(data, max_lag=args.max_lag)
+    selected_trends = [t for t, p in results.items() if p < 0.05]
+    print(f"Selected trends (p < 0.05): {selected_trends}")
 
-    clstm_params = {
-        "context": args.input_window,
-        "model_dim": 64,
-        "num_heads": 4,
-        "num_layers": 2,
-        "dropout": 0.1,
+    all_trends = generate_shifted_trends(data, valid_lags)
+    correlations = all_trends.corr()["unique_num_plate_count"]
+    selected_columns = [
+        col for col in all_trends.columns
+        if abs(correlations.get(col, 0)) >= args.corr_threshold
+        and any(t in col for t in selected_trends)
+    ]
+    print(f"Final feature columns ({len(selected_columns)}): {selected_columns}")
+
+    # Build Granger causal matrix C
+    causal_matrix_np = create_causal_matrix(data, selected_trends, lags, max_lag=args.max_lag)
+    causal_matrix = torch.tensor(causal_matrix_np, dtype=torch.float32)
+
+    model_params = {
+        "lstm_units": args.lstm_units,
+        "dense_units": args.dense_units,
+        "num_heads": args.num_heads,
+        "dropout_rate": args.dropout_rate,
+        "alpha_causal": args.alpha_causal,
     }
     training_params = {
         "learning_rate": args.learning_rate,
         "epochs": args.epochs,
-        "lam": args.lam,
-        "lam_ridge": args.lam_ridge,
-        "check_every": args.check_every,
-        "verbose": args.verbose,
         "batch_size": args.batch_size,
+        "verbose": args.verbose,
     }
 
-    print("Starting CGTST cross-validation training...")
+    print("Starting GCT cross-validation training (10-fold expanding window)...")
     last_history, models, fold_summaries, validation_data = prepare_data_for_model_cv(
-        data, feature_columns, clstm_params, training_params,
-        folder=args.folder, device=device,
+        data=all_trends,
+        selected_columns=selected_columns,
+        model_params=model_params,
+        training_params=training_params,
+        causal_matrix=causal_matrix,
+        folder=args.folder,
+        device=device,
         n_splits=args.n_splits,
         min_train_ratio=args.min_train_ratio,
         max_train_ratio=args.max_train_ratio,
         test_ratio=args.test_ratio,
-        case="cgtst",
+        context=args.input_window,
+        case="gct_full",
     )
 
     print("\nRunning Permutation Feature Importance (PFI)...")
     for idx, model in enumerate(models):
         X_val_arr, Y_val_arr = validation_data[idx]
         causal = permutation_feature_importance(
-            model, X_val_arr, Y_val_arr, feature_columns, threshold=1.0
+            model, X_val_arr, Y_val_arr, selected_columns, threshold=1.0
         )
         print(f"  Fold {idx + 1} causal features: {causal}")
 
     if last_history:
-        plot_loss(last_history, model_type="cgtst_pytorch", folder=args.folder)
+        plot_loss(last_history, model_type="gct", folder=args.folder)
     print("Done.")
 
 
