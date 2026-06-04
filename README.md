@@ -4,6 +4,7 @@
 
 A time-series forecasting model that integrates **Granger causality analysis** with a **Transformer architecture** to predict traffic flow in smart villages. The model uses Google Trends data as exogenous signals, applying EEMD denoising and a learned causality gate to weight feature contributions based on their causal relationship with the target variable.
 
+
 ## Architecture
 
 <p align="center">

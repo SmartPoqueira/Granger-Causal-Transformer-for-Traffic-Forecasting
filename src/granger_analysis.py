@@ -154,7 +154,7 @@ class SelfAttentionWithCausality(tf.keras.layers.Layer):
 
             causal_adjustment = 1 + self.alpha * causal_adjustment
 
-            #Producto Hadamard
+                    # Hadamard product with causal adjustment
             adjusted_attention = attention_output * causal_adjustment
             return adjusted_attention
         else:
@@ -171,15 +171,15 @@ def create_causal_matrix(data, selected_trends, lags, max_lag=6):
     for i, trend_i in enumerate(selected_trends):
         for j, trend_j in enumerate(selected_trends):
             if i != j:
-                # Realiza la prueba de causalidad de Granger para determinar la causalidad
+                # Run Granger causality test to determine causal direction
                 result = grangercausalitytests(data[[trend_j, trend_i]], max_lag, verbose=False)
                 p_values = [result[lag][0]['ssr_ftest'][1] for lag in range(1, max_lag + 1)]
                 min_p_value = min(p_values)
-                if min_p_value < 0.05:  # Considera solo relaciones con p-value significativo
+                if min_p_value < 0.05:  # Only consider relationships with significant p-value
                     best_lag = p_values.index(min_p_value) + 1
-                    causal_matrix[i, j] = 1/best_lag  # Inversa del mejor lag como indicador de causalidad
+                    causal_matrix[i, j] = 1/best_lag  # Inverse of best lag as causality strength
                 else:
-                    causal_matrix[i, j] = 0  # No hay causalidad significativa
+                    causal_matrix[i, j] = 0  # No significant causality
 
     return causal_matrix
 
@@ -223,7 +223,7 @@ def create_transformer_model(input_shape, params, causal_matrix, alpha):
 
 
 import numpy as np
-import time  # Importamos la librería time para medir el tiempo de ejecución
+import time  # measure fold execution time
 
 def prepare_data_for_model_cv(data, selected_columns, params, causal_matrix, alpha, n_splits=5, min_train_ratio=0.5, max_train_ratio=0.8, test_ratio=0.2, case='multivariate_causality'):
     X = data[selected_columns + ['unique_num_plate_count']].values
@@ -250,14 +250,14 @@ def prepare_data_for_model_cv(data, selected_columns, params, causal_matrix, alp
     fold_summaries = []
     histories = []
 
-    total_time = 0  # Variable para almacenar el tiempo total de ejecución
+    total_time = 0  # accumulates total execution time across folds
 
     with open(f"{FOLDER}/multivariate_causality.txt", 'w') as f:
         f.write(f"\n\n--- {case.capitalize()} Model Results ---\n")
         f.write(f"Total number of instances: {total_samples}\n")
 
         for fold, (train_index, test_index) in enumerate(splits):
-            start_time = time.time()  # Inicia el temporizador para este fold
+            start_time = time.time()  # start fold timer
 
             X_train, X_test = X[train_index], X[test_index]
             y_train, y_test = y[train_index], y[test_index]
@@ -302,17 +302,17 @@ def prepare_data_for_model_cv(data, selected_columns, params, causal_matrix, alp
             f.write(f"MSE: {fold_summary['mse']:.4f}\n")
             f.write(f"R2: {fold_summary['r2']:.4f}\n")
 
-            # Calcula el tiempo de ejecución del fold
+            # Compute fold execution time
             fold_execution_time = time.time() - start_time
             total_time += fold_execution_time
             f.write(f"Execution Time (Fold {fold + 1}): {fold_execution_time:.2f} seconds\n")
 
-        # Cálculos finales
+        # Final aggregated metrics
         if fold_summaries:
             avg_mae = np.mean([s['mae'] for s in fold_summaries])
             avg_mse = np.mean([s['mse'] for s in fold_summaries])
             avg_r2 = np.mean([s['r2'] for s in fold_summaries])
-            avg_execution_time = total_time / n_splits  # Promedio de tiempo de ejecución
+            avg_execution_time = total_time / n_splits  # average execution time per fold
 
             f.write(f"\n{case.capitalize()} case - Average MAE: {avg_mae:.4f}\n")
             f.write(f"{case.capitalize()} case - Average MSE: {avg_mse:.4f}\n")
@@ -333,19 +333,19 @@ def main():
 
     results, lags, valid_lags, run_test_results = granger_causality_test(data)
     
-    # Selecciona las tendencias basadas en la prueba de Granger con p-value < 0.05
+    # Select trends that pass the Granger test at p < 0.05
     selected_trends = [trend for trend, p_value in results.items() if p_value < 0.05]
 
-    print(f"Tendencias seleccionadas para la predicción: {selected_trends}")
-    
-    # Genera las series desplazadas basadas en los lags válidos
+    print(f"Selected trends for forecasting: {selected_trends}")
+
+    # Generate lagged versions based on valid Granger lags
     all_trends = generate_shifted_trends(data, valid_lags)
-    
-    # Selecciona las columnas con alta correlación con la variable objetivo y que están en selected_trends
+
+    # Select columns highly correlated (>= 0.5) with the target and present in selected_trends
     correlations = all_trends.corr()['unique_num_plate_count']
     selected_columns = [col for col in all_trends.columns if correlations[col] >= 0.5 and any(trend in col for trend in selected_trends)]
-    
-    print(f"Columnas seleccionadas para el modelo multivariado: {selected_columns}")
+
+    print(f"Feature columns selected for the multivariate model: {selected_columns}")
 
 
     alpha = 1
@@ -363,7 +363,7 @@ def main():
         'epochs': 200
     }
 
-    print("Modelo Multivariado (Tendencias Seleccionadas):")
+    print("Multivariate Model (Selected Trends):")
     last_history = prepare_data_for_model_cv(all_trends, selected_columns, transformer_params, causal_matrix, alpha, n_splits=10, case='multivariate_causality')
 
     plot_loss(last_history)

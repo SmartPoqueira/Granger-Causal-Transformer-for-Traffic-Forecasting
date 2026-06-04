@@ -18,16 +18,15 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from statsmodels.tsa.stattools import grangercausalitytests
 from statsmodels.sandbox.stats.runs import runstest_1samp
 
-# Asegúrate de instalar PyEMD antes de continuar
-# Puedes instalarlo usando: pip install PyEMD
+# Install PyEMD before running: pip install PyEMD
 from PyEMD import EEMD
 
-# Configurar dispositivo (GPU si está disponible)
+# Select device (GPU if available)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def set_seed(seed=42):
-    """Establece la semilla para reproducibilidad."""
+    """Set random seeds for reproducibility."""
     np.random.seed(seed)
     random.seed(seed)
     torch.manual_seed(seed)
@@ -36,7 +35,7 @@ def set_seed(seed=42):
 
 
 def activation_helper(name):
-    """Devuelve una función de activación basada en el nombre proporcionado."""
+    """Return an activation function by name."""
     name = name.lower()
     if name == 'relu':
         return nn.ReLU()
@@ -49,7 +48,7 @@ def activation_helper(name):
 
 
 def normalize_data(data):
-    """Normaliza los datos usando MinMaxScaler."""
+    """Normalise data using MinMaxScaler."""
     scaler = MinMaxScaler()
     normalized_data = scaler.fit_transform(data)
     return pd.DataFrame(normalized_data, index=data.index, columns=data.columns)
@@ -57,15 +56,15 @@ def normalize_data(data):
 
 def apply_eemd_denoising(data, num_imfs=5, noise_width=0.05):
     """
-    Aplica EEMD a cada serie temporal y reconstruye la señal usando los IMFs de baja frecuencia.
-    
+    Apply EEMD to each time series and reconstruct the signal using low-frequency IMFs.
+
     Args:
-        data (pd.DataFrame): Datos normalizados.
-        num_imfs (int): Número de IMFs a retener para reconstrucción.
-        noise_width (float): Ancho de ruido para EEMD.
-        
+        data (pd.DataFrame): Normalised data.
+        num_imfs (int): Number of IMFs to retain for reconstruction.
+        noise_width (float): Noise width for EEMD.
+
     Returns:
-        pd.DataFrame: Datos denoised.
+        pd.DataFrame: Denoised data.
     """
     eemd = EEMD(trials=50, noise_width=noise_width)
     denoised_data = pd.DataFrame(index=data.index)
@@ -73,7 +72,7 @@ def apply_eemd_denoising(data, num_imfs=5, noise_width=0.05):
     for column in data.columns:
         signal = data[column].values
         IMFs = eemd.eemd(signal)
-        # Retener los primeros 'num_imfs' IMFs (baja frecuencia)
+        # Retain the first 'num_imfs' IMFs (low frequency)
         reconstructed = np.sum(IMFs[:num_imfs], axis=0)
         denoised_data[column] = reconstructed
 
@@ -81,7 +80,7 @@ def apply_eemd_denoising(data, num_imfs=5, noise_width=0.05):
 
 
 def load_and_prepare_data(trends_file, plates_file, normalize=True, apply_eemd=True, num_imfs=5, noise_width=0.05):
-    """Carga y prepara los datos fusionando dos archivos CSV y aplicando EEMD para denoising."""
+    """Load and prepare data by merging two CSV files and applying EEMD denoising."""
     trends_data = pd.read_csv(trends_file, parse_dates=['Semana'])
     plates_data = pd.read_csv(plates_file, parse_dates=['week'])
 
@@ -101,14 +100,14 @@ def load_and_prepare_data(trends_file, plates_file, normalize=True, apply_eemd=T
 
 
 def run_test(series):
-    """Ejecuta una prueba de runs en la serie temporal."""
+    """Run a runs test on the time series."""
     _, p_value = runstest_1samp(series)
     return p_value
 
 
 def granger_causality_test(data, max_lag=6):
     """
-    Realiza pruebas de causalidad de Granger para cada columna en los datos.
+    Run Granger causality tests for each column against the target variable.
     """
     results, lags, valid_lags, run_test_results = {}, {}, {}, {}
     for col in data.columns:
@@ -128,8 +127,8 @@ def granger_causality_test(data, max_lag=6):
 
 def generate_shifted_trends(data, valid_lags):
     """
-    Genera versiones desplazadas de las series temporales basadas en lags válidos.
-    """
+    Generate lagged versions of time series based on valid Granger lags.
+    ""
     shifted_trends = pd.DataFrame(index=data.index)
     for trend, lag_list in valid_lags.items():
         for lag in lag_list:
@@ -139,7 +138,7 @@ def generate_shifted_trends(data, valid_lags):
 
 def plot_loss(history, model_type="clstm", folder='plots'):
     """
-    Genera y guarda un gráfico de pérdida de entrenamiento y validación.
+    Generate and save a training and validation loss curve.
     """
     plt.figure(figsize=(10, 6))
     
@@ -409,17 +408,17 @@ def train_model_cgtst(cgtst, X_train, Y_train, X_val, Y_val, lr, max_iter, lam=0
 
 def permutation_feature_importance(model, X_val, Y_val, selected_columns, threshold=1.0):
     """
-    Implementa el método de Importancia de Características por Permutación (PFI) para validar relaciones causales.
-    
+    Permutation Feature Importance (PFI) to validate causal relationships.
+
     Args:
-        model (CGTST): Modelo entrenado.
-        X_val (torch.Tensor): Datos de validación de entrada.
-        Y_val (torch.Tensor): Datos de validación de salida.
-        selected_columns (list): Lista de nombres de las columnas de características.
-        threshold (float): Umbral para determinar relaciones causales espurias.
-        
+        model (CGTST): Trained model.
+        X_val (torch.Tensor): Validation input data.
+        Y_val (torch.Tensor): Validation target data.
+        selected_columns (list): Feature column names.
+        threshold (float): PFI ratio threshold below which a variable is considered causal.
+
     Returns:
-        dict: Relaciones causales validadas.
+        dict: Validated causal relationships.
     """
     model.eval()
     loss_fn = nn.MSELoss(reduction='mean')
@@ -430,9 +429,8 @@ def permutation_feature_importance(model, X_val, Y_val, selected_columns, thresh
     causal_relationships = {}
 
     for i, col in enumerate(selected_columns):
-        # Permutar la columna
+        # Permute the feature along the temporal dimension
         X_permuted = X_val.clone()
-        # Permute temporal dimension (axis=1)
         perm_indices = torch.randperm(X_permuted.size(1))
         X_permuted[:, :, i] = X_permuted[:, perm_indices, i]
         
@@ -441,11 +439,10 @@ def permutation_feature_importance(model, X_val, Y_val, selected_columns, thresh
             y_pred_permuted = model(X_permuted)
             permuted_loss = loss_fn(y_pred_permuted, Y_val).item()
         
-        # Calcular el ratio de PFI
+        # PFI ratio: < threshold means the variable is causal
         pfi_ratio = original_loss / permuted_loss if permuted_loss != 0 else float('inf')
         print(f"PFI Ratio for {col}: {pfi_ratio:.6f}")
 
-        # Determinar si la variable es causal
         if pfi_ratio < threshold:
             causal_relationships[col] = pfi_ratio
 
@@ -497,9 +494,9 @@ def prepare_data_for_model_cv(
     fold_summaries = []
     histories = []
     models = []
-    validation_data = []  # Lista para almacenar los datos de validación de cada fold
+    validation_data = []  # List to store validation data for each fold
 
-    total_time = 0 
+    total_time = 0        # Accumulator for total execution time
 
     os.makedirs(FOLDER, exist_ok=True)
 
