@@ -9,7 +9,7 @@ data:
   eemd_noise_width: 0.05
 
 granger:
-  max_lag: 6
+  max_lag: 12          # paper Section 3.2: p_max=12 weeks
   p_value_threshold: 0.05
   correlation_threshold: 0.5
   alpha: 1.0  # Causal attention scaling factor
@@ -23,11 +23,11 @@ model:
 
 training:
   optimizer: adam
-  learning_rate: 0.01
+  learning_rate: 0.0001  # paper Section 3.3 Table 1: Adam lr=1e-4
   epochs: 200
   lam: 0.001         # L1 regularization on causality gates
   lam_ridge: 0.001   # Ridge regularization
-  batch_size: 128
+  batch_size: 64     # paper Section 3.3 Table 1: N_batch=64
   check_every: 1
   verbose: 1
 

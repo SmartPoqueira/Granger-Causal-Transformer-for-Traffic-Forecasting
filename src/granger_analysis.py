@@ -1,13 +1,20 @@
 """
 granger_analysis.py
 -------------------
-Alternative Keras/TensorFlow model: an LSTM + self-attention architecture with
-a Granger-causal masking layer.  This module implements the TF-based comparison
-model used in the ablation study alongside the main PyTorch CGTST.
+LEGACY Keras/TensorFlow implementation of the GCT pipeline used during
+prototyping. The canonical, paper-faithful implementation is src/model.py
+(PyTorch).
+
+⚠️  Known deviation from paper Eq. (4):
+    The paper formula applies the causal mask BEFORE softmax:
+        Attention(Q,K,V) = softmax( QKᵀ/√d_k  ⊙  (1+C) ) V
+    This module applies a post-hoc causal adjustment AFTER softmax because
+    tf.keras.layers.MultiHeadAttention does not expose raw attention scores.
+    This is an approximation; use src/model.py for faithful reproduction.
 
 References
 ----------
-Paper, Section 3.2 — "Causality-guided LSTM-Transformer (Keras baseline)".
+Paper, Section 3.3 — "GCT Architecture" and Algorithm 1.
 """
 
 import os
@@ -187,6 +194,14 @@ class SelfAttentionWithCausality(tf.keras.layers.Layer):
         )
 
     def call(self, inputs):
+        """
+        ⚠️  Post-softmax approximation of paper Eq. (4).
+        The paper formula applies (1+C) element-wise to raw QKᵀ/√dₖ scores
+        BEFORE softmax.  tf.keras.layers.MultiHeadAttention does not expose
+        those raw scores, so the causal adjustment is applied to the output
+        instead.  For the exact implementation see CausalSelfAttention in
+        src/model.py.
+        """
         attention_output = self.attention(inputs, inputs)
         if self.alpha != 0:
             causal_adjustment = tf.matmul(inputs, self.causal_matrix)
