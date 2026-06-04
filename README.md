@@ -86,11 +86,15 @@ python -m src.model --config configs/config.yaml
 ## Citation
 
 ```bibtex
-@inproceedings{duranlopez2025gct,
-  title={Granger-Causal Transformer for Traffic Flow Forecasting in Smart Villages},
-  author={Dur{\'a}n-L{\'o}pez, Alberto and Bola{\~n}os-Mart{\'i}nez, Daniel and Berm{\'u}dez-Edo, Mar{\'i}a and De, Suparna},
-  booktitle={Proceedings of the ACM Conference},
-  year={2025}
+@article{duran2026gct,
+  title={GCT: a Granger-causal transformer for multivariate traffic analysis in smart villages},
+  author={Dur{\'a}n-L{\'o}pez, Alberto and Bola{\~n}os-Martinez, Daniel and De, Suparna and Bermudez-Edo, Maria},
+  journal={ACM Transactions on Intelligent Systems and Technology},
+  volume={17},
+  number={2},
+  pages={1--25},
+  year={2026},
+  publisher={ACM New York, NY}
 }
 ```
 
